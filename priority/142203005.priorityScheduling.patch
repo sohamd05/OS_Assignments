@@ -1,0 +1,1367 @@
+diff --git a/112103120.patch b/112103120.patch
+new file mode 100644
+index 0000000..fe1054d
+--- /dev/null
++++ b/112103120.patch
+@@ -0,0 +1,252 @@
++diff --git a/Makefile b/Makefile
++index 09d790c..66c48b9 100644
++--- a/Makefile
+++++ b/Makefile
++@@ -51,7 +51,7 @@ TOOLPREFIX := $(shell if i386-jos-elf-objdump -i 2>&1 | grep '^elf32-i386$$' >/d
++ endif
++ 
++ # If the makefile can't find QEMU, specify its path here
++-# QEMU = qemu-system-i386
+++QEMU = qemu-system-i386
++ 
++ # Try to infer the correct QEMU
++ ifndef QEMU
++@@ -181,7 +181,8 @@ UPROGS=\
++ 	_usertests\
++ 	_wc\
++ 	_zombie\
++-
+++	_lseek\
+++	
++ fs.img: mkfs README $(UPROGS)
++ 	./mkfs fs.img README $(UPROGS)
++ 
++diff --git a/fcntl.h b/fcntl.h
++index d565483..5cd29b6 100644
++--- a/fcntl.h
+++++ b/fcntl.h
++@@ -2,3 +2,6 @@
++ #define O_WRONLY  0x001
++ #define O_RDWR    0x002
++ #define O_CREATE  0x200
+++#define SEEK_SET 0
+++#define SEEK_CUR 1
+++#define SEEK_END 2
++diff --git a/kalloc.c b/kalloc.c
++index 14cd4f4..12f1317 100644
++--- a/kalloc.c
+++++ b/kalloc.c
++@@ -1,20 +1,17 @@
++-// Physical memory allocator, intended to allocate
++-// memory for user processes, kernel stacks, page table pages,
++-// and pipe buffers. Allocates 4096-byte pages.
++-
++ #include "types.h"
++ #include "defs.h"
++ #include "param.h"
++ #include "memlayout.h"
++ #include "mmu.h"
++ #include "spinlock.h"
+++#include <stddef.h> // Include the <stddef.h> header for NULL
++ 
++ void freerange(void *vstart, void *vend);
++-extern char end[]; // first address after kernel loaded from ELF file
++-                   // defined by the kernel linker script in kernel.ld
+++extern char end[];
++ 
++ struct run {
++-  struct run *next;
+++  struct run *prev; // Pointer to the previous free frame
+++  struct run *next; // Pointer to the next free frame
++ };
++ 
++ struct {
++@@ -23,74 +20,69 @@ struct {
++   struct run *freelist;
++ } kmem;
++ 
++-// Initialization happens in two phases.
++-// 1. main() calls kinit1() while still using entrypgdir to place just
++-// the pages mapped by entrypgdir on free list.
++-// 2. main() calls kinit2() with the rest of the physical pages
++-// after installing a full page table that maps them on all cores.
++-void
++-kinit1(void *vstart, void *vend)
+++void kinit1(void *vstart, void *vend)
++ {
++   initlock(&kmem.lock, "kmem");
++   kmem.use_lock = 0;
++   freerange(vstart, vend);
++ }
++ 
++-void
++-kinit2(void *vstart, void *vend)
+++void kinit2(void *vstart, void *vend)
++ {
++   freerange(vstart, vend);
++   kmem.use_lock = 1;
++ }
++ 
++-void
++-freerange(void *vstart, void *vend)
+++void freerange(void *vstart, void *vend)
++ {
++   char *p;
++   p = (char*)PGROUNDUP((uint)vstart);
++   for(; p + PGSIZE <= (char*)vend; p += PGSIZE)
++     kfree(p);
++ }
++-//PAGEBREAK: 21
++-// Free the page of physical memory pointed at by v,
++-// which normally should have been returned by a
++-// call to kalloc().  (The exception is when
++-// initializing the allocator; see kinit above.)
++-void
++-kfree(char *v)
+++
+++void kfree(char *v)
++ {
++   struct run *r;
++ 
++   if((uint)v % PGSIZE || v < end || V2P(v) >= PHYSTOP)
++     panic("kfree");
++ 
++-  // Fill with junk to catch dangling refs.
++   memset(v, 1, PGSIZE);
++ 
++   if(kmem.use_lock)
++     acquire(&kmem.lock);
+++  
++   r = (struct run*)v;
++   r->next = kmem.freelist;
+++  r->prev = NULL; // For now, set prev to NULL
+++  
+++  if (kmem.freelist != NULL)
+++    kmem.freelist->prev = r;
+++  
++   kmem.freelist = r;
+++
++   if(kmem.use_lock)
++     release(&kmem.lock);
++ }
++ 
++-// Allocate one 4096-byte page of physical memory.
++-// Returns a pointer that the kernel can use.
++-// Returns 0 if the memory cannot be allocated.
++-char*
++-kalloc(void)
+++char* kalloc(void)
++ {
++   struct run *r;
++ 
++   if(kmem.use_lock)
++     acquire(&kmem.lock);
+++  
++   r = kmem.freelist;
++-  if(r)
+++  if(r) {
++     kmem.freelist = r->next;
+++    if (kmem.freelist != NULL)
+++      kmem.freelist->prev = NULL; // Update the previous pointer of the new head
+++  }
+++
++   if(kmem.use_lock)
++     release(&kmem.lock);
+++  
++   return (char*)r;
++ }
++ 
++diff --git a/syscall.c b/syscall.c
++index ee85261..bb96e30 100644
++--- a/syscall.c
+++++ b/syscall.c
++@@ -103,6 +103,7 @@ extern int sys_unlink(void);
++ extern int sys_wait(void);
++ extern int sys_write(void);
++ extern int sys_uptime(void);
+++extern int sys_lseek(void);
++ 
++ static int (*syscalls[])(void) = {
++ [SYS_fork]    sys_fork,
++@@ -126,6 +127,7 @@ static int (*syscalls[])(void) = {
++ [SYS_link]    sys_link,
++ [SYS_mkdir]   sys_mkdir,
++ [SYS_close]   sys_close,
+++[SYS_lseek]   sys_lseek,
++ };
++ 
++ void
++diff --git a/syscall.h b/syscall.h
++index bc5f356..93fbf00 100644
++--- a/syscall.h
+++++ b/syscall.h
++@@ -20,3 +20,4 @@
++ #define SYS_link   19
++ #define SYS_mkdir  20
++ #define SYS_close  21
+++#define SYS_lseek  22
++diff --git a/sysfile.c b/sysfile.c
++index bfe61b7..33443c6 100644
++--- a/sysfile.c
+++++ b/sysfile.c
++@@ -442,3 +442,38 @@ sys_pipe(void)
++   fd[1] = fd1;
++   return 0;
++ }
+++
+++int
+++sys_lseek(void)
+++{
+++    int fd, offset, whence;
+++    struct file *f;
+++
+++    if (argfd(0, &fd,&f) < 0 || argint(1, &offset) < 0 || argint(2, &whence) < 0)
+++        return -1;
+++
+++    if (whence < 0 || whence > 2)
+++        return -1;
+++
+++  
+++
+++    switch (whence)
+++    {
+++    case SEEK_SET:
+++        f->off = offset;
+++        break;
+++    case SEEK_CUR:
+++        f->off += offset;
+++        break;
+++    case SEEK_END:
+++        f->off = f->ip->size + offset;
+++        break;
+++    default:
+++
+++        return -1;
+++    }
+++
+++    //release(&f->ip->lock);
+++    return f->off;
+++}
+++
++diff --git a/user.h b/user.h
++index 4f99c52..11e5df3 100644
++--- a/user.h
+++++ b/user.h
++@@ -23,7 +23,7 @@ int getpid(void);
++ char* sbrk(int);
++ int sleep(int);
++ int uptime(void);
++-
+++int lseek(int,int,int);
++ // ulib.c
++ int stat(const char*, struct stat*);
++ char* strcpy(char*, const char*);
++diff --git a/usys.S b/usys.S
++index 8bfd8a1..6244300 100644
++--- a/usys.S
+++++ b/usys.S
++@@ -29,3 +29,4 @@ SYSCALL(getpid)
++ SYSCALL(sbrk)
++ SYSCALL(sleep)
++ SYSCALL(uptime)
+++SYSCALL(lseek)
+diff --git a/142203005.patch b/142203005.patch
+new file mode 100644
+index 0000000..7c71e28
+--- /dev/null
++++ b/142203005.patch
+@@ -0,0 +1,128 @@
++diff --git a/Makefile b/Makefile
++index 09d790c..66c48b9 100644
++--- a/Makefile
+++++ b/Makefile
++@@ -51,7 +51,7 @@ TOOLPREFIX := $(shell if i386-jos-elf-objdump -i 2>&1 | grep '^elf32-i386$$' >/d
++ endif
++ 
++ # If the makefile can't find QEMU, specify its path here
++-# QEMU = qemu-system-i386
+++QEMU = qemu-system-i386
++ 
++ # Try to infer the correct QEMU
++ ifndef QEMU
++@@ -181,7 +181,8 @@ UPROGS=\
++ 	_usertests\
++ 	_wc\
++ 	_zombie\
++-
+++	_lseek\
+++	
++ fs.img: mkfs README $(UPROGS)
++ 	./mkfs fs.img README $(UPROGS)
++ 
++diff --git a/fcntl.h b/fcntl.h
++index d565483..5cd29b6 100644
++--- a/fcntl.h
+++++ b/fcntl.h
++@@ -2,3 +2,6 @@
++ #define O_WRONLY  0x001
++ #define O_RDWR    0x002
++ #define O_CREATE  0x200
+++#define SEEK_SET 0
+++#define SEEK_CUR 1
+++#define SEEK_END 2
++diff --git a/syscall.c b/syscall.c
++index ee85261..bb96e30 100644
++--- a/syscall.c
+++++ b/syscall.c
++@@ -103,6 +103,7 @@ extern int sys_unlink(void);
++ extern int sys_wait(void);
++ extern int sys_write(void);
++ extern int sys_uptime(void);
+++extern int sys_lseek(void);
++ 
++ static int (*syscalls[])(void) = {
++ [SYS_fork]    sys_fork,
++@@ -126,6 +127,7 @@ static int (*syscalls[])(void) = {
++ [SYS_link]    sys_link,
++ [SYS_mkdir]   sys_mkdir,
++ [SYS_close]   sys_close,
+++[SYS_lseek]   sys_lseek,
++ };
++ 
++ void
++diff --git a/syscall.h b/syscall.h
++index bc5f356..93fbf00 100644
++--- a/syscall.h
+++++ b/syscall.h
++@@ -20,3 +20,4 @@
++ #define SYS_link   19
++ #define SYS_mkdir  20
++ #define SYS_close  21
+++#define SYS_lseek  22
++diff --git a/sysfile.c b/sysfile.c
++index bfe61b7..33443c6 100644
++--- a/sysfile.c
+++++ b/sysfile.c
++@@ -442,3 +442,38 @@ sys_pipe(void)
++   fd[1] = fd1;
++   return 0;
++ }
+++
+++int
+++sys_lseek(void)
+++{
+++    int fd, offset, whence;
+++    struct file *f;
+++
+++    if (argfd(0, &fd,&f) < 0 || argint(1, &offset) < 0 || argint(2, &whence) < 0)
+++        return -1;
+++
+++    if (whence < 0 || whence > 2)
+++        return -1;
+++
+++  
+++
+++    switch (whence)
+++    {
+++    case SEEK_SET:
+++        f->off = offset;
+++        break;
+++    case SEEK_CUR:
+++        f->off += offset;
+++        break;
+++    case SEEK_END:
+++        f->off = f->ip->size + offset;
+++        break;
+++    default:
+++
+++        return -1;
+++    }
+++
+++    //release(&f->ip->lock);
+++    return f->off;
+++}
+++
++diff --git a/user.h b/user.h
++index 4f99c52..11e5df3 100644
++--- a/user.h
+++++ b/user.h
++@@ -23,7 +23,7 @@ int getpid(void);
++ char* sbrk(int);
++ int sleep(int);
++ int uptime(void);
++-
+++int lseek(int,int,int);
++ // ulib.c
++ int stat(const char*, struct stat*);
++ char* strcpy(char*, const char*);
++diff --git a/usys.S b/usys.S
++index 8bfd8a1..6244300 100644
++--- a/usys.S
+++++ b/usys.S
++@@ -29,3 +29,4 @@ SYSCALL(getpid)
++ SYSCALL(sbrk)
++ SYSCALL(sleep)
++ SYSCALL(uptime)
+++SYSCALL(lseek)
+diff --git a/142203005.priorityScheduling.patch b/142203005.priorityScheduling.patch
+new file mode 100644
+index 0000000..3b3328d
+--- /dev/null
++++ b/142203005.priorityScheduling.patch
+@@ -0,0 +1,355 @@
++diff --git a/112103120.patch b/112103120.patch
++new file mode 100644
++index 0000000..fe1054d
++--- /dev/null
+++++ b/112103120.patch
++@@ -0,0 +1,252 @@
+++diff --git a/Makefile b/Makefile
+++index 09d790c..66c48b9 100644
+++--- a/Makefile
++++++ b/Makefile
+++@@ -51,7 +51,7 @@ TOOLPREFIX := $(shell if i386-jos-elf-objdump -i 2>&1 | grep '^elf32-i386$$' >/d
+++ endif
+++ 
+++ # If the makefile can't find QEMU, specify its path here
+++-# QEMU = qemu-system-i386
++++QEMU = qemu-system-i386
+++ 
+++ # Try to infer the correct QEMU
+++ ifndef QEMU
+++@@ -181,7 +181,8 @@ UPROGS=\
+++ 	_usertests\
+++ 	_wc\
+++ 	_zombie\
+++-
++++	_lseek\
++++	
+++ fs.img: mkfs README $(UPROGS)
+++ 	./mkfs fs.img README $(UPROGS)
+++ 
+++diff --git a/fcntl.h b/fcntl.h
+++index d565483..5cd29b6 100644
+++--- a/fcntl.h
++++++ b/fcntl.h
+++@@ -2,3 +2,6 @@
+++ #define O_WRONLY  0x001
+++ #define O_RDWR    0x002
+++ #define O_CREATE  0x200
++++#define SEEK_SET 0
++++#define SEEK_CUR 1
++++#define SEEK_END 2
+++diff --git a/kalloc.c b/kalloc.c
+++index 14cd4f4..12f1317 100644
+++--- a/kalloc.c
++++++ b/kalloc.c
+++@@ -1,20 +1,17 @@
+++-// Physical memory allocator, intended to allocate
+++-// memory for user processes, kernel stacks, page table pages,
+++-// and pipe buffers. Allocates 4096-byte pages.
+++-
+++ #include "types.h"
+++ #include "defs.h"
+++ #include "param.h"
+++ #include "memlayout.h"
+++ #include "mmu.h"
+++ #include "spinlock.h"
++++#include <stddef.h> // Include the <stddef.h> header for NULL
+++ 
+++ void freerange(void *vstart, void *vend);
+++-extern char end[]; // first address after kernel loaded from ELF file
+++-                   // defined by the kernel linker script in kernel.ld
++++extern char end[];
+++ 
+++ struct run {
+++-  struct run *next;
++++  struct run *prev; // Pointer to the previous free frame
++++  struct run *next; // Pointer to the next free frame
+++ };
+++ 
+++ struct {
+++@@ -23,74 +20,69 @@ struct {
+++   struct run *freelist;
+++ } kmem;
+++ 
+++-// Initialization happens in two phases.
+++-// 1. main() calls kinit1() while still using entrypgdir to place just
+++-// the pages mapped by entrypgdir on free list.
+++-// 2. main() calls kinit2() with the rest of the physical pages
+++-// after installing a full page table that maps them on all cores.
+++-void
+++-kinit1(void *vstart, void *vend)
++++void kinit1(void *vstart, void *vend)
+++ {
+++   initlock(&kmem.lock, "kmem");
+++   kmem.use_lock = 0;
+++   freerange(vstart, vend);
+++ }
+++ 
+++-void
+++-kinit2(void *vstart, void *vend)
++++void kinit2(void *vstart, void *vend)
+++ {
+++   freerange(vstart, vend);
+++   kmem.use_lock = 1;
+++ }
+++ 
+++-void
+++-freerange(void *vstart, void *vend)
++++void freerange(void *vstart, void *vend)
+++ {
+++   char *p;
+++   p = (char*)PGROUNDUP((uint)vstart);
+++   for(; p + PGSIZE <= (char*)vend; p += PGSIZE)
+++     kfree(p);
+++ }
+++-//PAGEBREAK: 21
+++-// Free the page of physical memory pointed at by v,
+++-// which normally should have been returned by a
+++-// call to kalloc().  (The exception is when
+++-// initializing the allocator; see kinit above.)
+++-void
+++-kfree(char *v)
++++
++++void kfree(char *v)
+++ {
+++   struct run *r;
+++ 
+++   if((uint)v % PGSIZE || v < end || V2P(v) >= PHYSTOP)
+++     panic("kfree");
+++ 
+++-  // Fill with junk to catch dangling refs.
+++   memset(v, 1, PGSIZE);
+++ 
+++   if(kmem.use_lock)
+++     acquire(&kmem.lock);
++++  
+++   r = (struct run*)v;
+++   r->next = kmem.freelist;
++++  r->prev = NULL; // For now, set prev to NULL
++++  
++++  if (kmem.freelist != NULL)
++++    kmem.freelist->prev = r;
++++  
+++   kmem.freelist = r;
++++
+++   if(kmem.use_lock)
+++     release(&kmem.lock);
+++ }
+++ 
+++-// Allocate one 4096-byte page of physical memory.
+++-// Returns a pointer that the kernel can use.
+++-// Returns 0 if the memory cannot be allocated.
+++-char*
+++-kalloc(void)
++++char* kalloc(void)
+++ {
+++   struct run *r;
+++ 
+++   if(kmem.use_lock)
+++     acquire(&kmem.lock);
++++  
+++   r = kmem.freelist;
+++-  if(r)
++++  if(r) {
+++     kmem.freelist = r->next;
++++    if (kmem.freelist != NULL)
++++      kmem.freelist->prev = NULL; // Update the previous pointer of the new head
++++  }
++++
+++   if(kmem.use_lock)
+++     release(&kmem.lock);
++++  
+++   return (char*)r;
+++ }
+++ 
+++diff --git a/syscall.c b/syscall.c
+++index ee85261..bb96e30 100644
+++--- a/syscall.c
++++++ b/syscall.c
+++@@ -103,6 +103,7 @@ extern int sys_unlink(void);
+++ extern int sys_wait(void);
+++ extern int sys_write(void);
+++ extern int sys_uptime(void);
++++extern int sys_lseek(void);
+++ 
+++ static int (*syscalls[])(void) = {
+++ [SYS_fork]    sys_fork,
+++@@ -126,6 +127,7 @@ static int (*syscalls[])(void) = {
+++ [SYS_link]    sys_link,
+++ [SYS_mkdir]   sys_mkdir,
+++ [SYS_close]   sys_close,
++++[SYS_lseek]   sys_lseek,
+++ };
+++ 
+++ void
+++diff --git a/syscall.h b/syscall.h
+++index bc5f356..93fbf00 100644
+++--- a/syscall.h
++++++ b/syscall.h
+++@@ -20,3 +20,4 @@
+++ #define SYS_link   19
+++ #define SYS_mkdir  20
+++ #define SYS_close  21
++++#define SYS_lseek  22
+++diff --git a/sysfile.c b/sysfile.c
+++index bfe61b7..33443c6 100644
+++--- a/sysfile.c
++++++ b/sysfile.c
+++@@ -442,3 +442,38 @@ sys_pipe(void)
+++   fd[1] = fd1;
+++   return 0;
+++ }
++++
++++int
++++sys_lseek(void)
++++{
++++    int fd, offset, whence;
++++    struct file *f;
++++
++++    if (argfd(0, &fd,&f) < 0 || argint(1, &offset) < 0 || argint(2, &whence) < 0)
++++        return -1;
++++
++++    if (whence < 0 || whence > 2)
++++        return -1;
++++
++++  
++++
++++    switch (whence)
++++    {
++++    case SEEK_SET:
++++        f->off = offset;
++++        break;
++++    case SEEK_CUR:
++++        f->off += offset;
++++        break;
++++    case SEEK_END:
++++        f->off = f->ip->size + offset;
++++        break;
++++    default:
++++
++++        return -1;
++++    }
++++
++++    //release(&f->ip->lock);
++++    return f->off;
++++}
++++
+++diff --git a/user.h b/user.h
+++index 4f99c52..11e5df3 100644
+++--- a/user.h
++++++ b/user.h
+++@@ -23,7 +23,7 @@ int getpid(void);
+++ char* sbrk(int);
+++ int sleep(int);
+++ int uptime(void);
+++-
++++int lseek(int,int,int);
+++ // ulib.c
+++ int stat(const char*, struct stat*);
+++ char* strcpy(char*, const char*);
+++diff --git a/usys.S b/usys.S
+++index 8bfd8a1..6244300 100644
+++--- a/usys.S
++++++ b/usys.S
+++@@ -29,3 +29,4 @@ SYSCALL(getpid)
+++ SYSCALL(sbrk)
+++ SYSCALL(sleep)
+++ SYSCALL(uptime)
++++SYSCALL(lseek)
++diff --git a/142203005.patch b/142203005.patch
++new file mode 100644
++index 0000000..7c71e28
++--- /dev/null
+++++ b/142203005.patch
++@@ -0,0 +1,128 @@
+++diff --git a/Makefile b/Makefile
+++index 09d790c..66c48b9 100644
+++--- a/Makefile
++++++ b/Makefile
+++@@ -51,7 +51,7 @@ TOOLPREFIX := $(shell if i386-jos-elf-objdump -i 2>&1 | grep '^elf32-i386$$' >/d
+++ endif
+++ 
+++ # If the makefile can't find QEMU, specify its path here
+++-# QEMU = qemu-system-i386
++++QEMU = qemu-system-i386
+++ 
+++ # Try to infer the correct QEMU
+++ ifndef QEMU
+++@@ -181,7 +181,8 @@ UPROGS=\
+++ 	_usertests\
+++ 	_wc\
+++ 	_zombie\
+++-
++++	_lseek\
++++	
+++ fs.img: mkfs README $(UPROGS)
+++ 	./mkfs fs.img README $(UPROGS)
+++ 
+++diff --git a/fcntl.h b/fcntl.h
+++index d565483..5cd29b6 100644
+++--- a/fcntl.h
++++++ b/fcntl.h
+++@@ -2,3 +2,6 @@
+++ #define O_WRONLY  0x001
+++ #define O_RDWR    0x002
+++ #define O_CREATE  0x200
++++#define SEEK_SET 0
++++#define SEEK_CUR 1
++++#define SEEK_END 2
+++diff --git a/syscall.c b/syscall.c
+++index ee85261..bb96e30 100644
+++--- a/syscall.c
++++++ b/syscall.c
+++@@ -103,6 +103,7 @@ extern int sys_unlink(void);
+++ extern int sys_wait(void);
+++ extern int sys_write(void);
+++ extern int sys_uptime(void);
++++extern int sys_lseek(void);
+++ 
+++ static int (*syscalls[])(void) = {
+++ [SYS_fork]    sys_fork,
+++@@ -126,6 +127,7 @@ static int (*syscalls[])(void) = {
+++ [SYS_link]    sys_link,
+++ [SYS_mkdir]   sys_mkdir,
+++ [SYS_close]   sys_close,
++++[SYS_lseek]   sys_lseek,
+++ };
+++ 
+++ void
+++diff --git a/syscall.h b/syscall.h
+++index bc5f356..93fbf00 100644
+++--- a/syscall.h
++++++ b/syscall.h
+++@@ -20,3 +20,4 @@
+++ #define SYS_link   19
+++ #define SYS_mkdir  20
+++ #define SYS_close  21
++++#define SYS_lseek  22
+++diff --git a/sysfile.c b/sysfile.c
+++index bfe61b7..33443c6 100644
+++--- a/sysfile.c
++++++ b/sysfile.c
+++@@ -442,3 +442,38 @@ sys_pipe(void)
+++   fd[1] = fd1;
+++   return 0;
+++ }
++++
++++int
++++sys_lseek(void)
++++{
++++    int fd, offset, whence;
++++    struct file *f;
++++
++++    if (argfd(0, &fd,&f) < 0 || argint(1, &offset) < 0 || argint(2, &whence) < 0)
++++        return -1;
++++
++++    if (whence < 0 || whence > 2)
++++        return -1;
++++
++++  
++++
++++    switch (whence)
++++    {
++++    case SEEK_SET:
++++        f->off = offset;
++++
+\ No newline at end of file
+diff --git a/Makefile b/Makefile
+index 09d790c..29c64a6 100644
+--- a/Makefile
++++ b/Makefile
+@@ -51,7 +51,7 @@ TOOLPREFIX := $(shell if i386-jos-elf-objdump -i 2>&1 | grep '^elf32-i386$$' >/d
+ endif
+ 
+ # If the makefile can't find QEMU, specify its path here
+-# QEMU = qemu-system-i386
++QEMU = qemu-system-i386
+ 
+ # Try to infer the correct QEMU
+ ifndef QEMU
+@@ -181,6 +181,11 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_lseek\
++	_ps\
++	_dpro\
++	_nice\
++	_test\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/defs.h b/defs.h
+index 82fb982..b93000e 100644
+--- a/defs.h
++++ b/defs.h
+@@ -120,6 +120,8 @@ void            userinit(void);
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++int 		cps(void);
++int 		chpr(int pid , int priority);
+ 
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+diff --git a/dpro.c b/dpro.c
+new file mode 100644
+index 0000000..fce1d5d
+--- /dev/null
++++ b/dpro.c
+@@ -0,0 +1,42 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++#include "fcntl.h"
++
++int main(int argc, char *argv[]) {
++  int start = uptime();
++  int pid;
++  int k, n;
++  int x;
++  volatile int z;
++  if(argc < 2)
++	n = 1; //Default
++  else
++	n = atoi(argv[1]);
++  if (n < 0 ||n > 20)
++	n = 2;
++  x = 0;
++  pid = 0;
++  n = 1;
++  for ( k = 0; k < n; k++ ) {
++    pid = fork ();
++    if ( pid < 0 ) {
++      printf(1, "%d failed in fork!\n", getpid());
++    } else if (pid > 0) {
++      // parent
++      printf(1, "Parent %d creating child %d\n",getpid(), pid);
++      wait();
++      }
++      else{
++	printf(1,"Child %d created\n",getpid());
++	for(int i = 0 ; i < 40; i++){
++    for(z = 0; z < 100000000; z+=1){
++	    x = x + 3.14*89.64; //Useless calculation to consume CPU Time
++    }
++  }
++	break;
++      }
++  }
++  printf(1,"%d to %d \n",start,uptime());
++  exit();
++}
+diff --git a/exec.c b/exec.c
+index b40134f..0c6f3f9 100644
+--- a/exec.c
++++ b/exec.c
+@@ -101,6 +101,7 @@ exec(char *path, char **argv)
+   curproc->tf->esp = sp;
+   switchuvm(curproc);
+   freevm(oldpgdir);
++  curproc->priority = 2;
+   return 0;
+ 
+  bad:
+@@ -112,3 +113,5 @@ exec(char *path, char **argv)
+   }
+   return -1;
+ }
++
++
+diff --git a/fcntl.h b/fcntl.h
+index d565483..5cd29b6 100644
+--- a/fcntl.h
++++ b/fcntl.h
+@@ -2,3 +2,6 @@
+ #define O_WRONLY  0x001
+ #define O_RDWR    0x002
+ #define O_CREATE  0x200
++#define SEEK_SET 0
++#define SEEK_CUR 1
++#define SEEK_END 2
+diff --git a/kalloc.c b/kalloc.c
+index 14cd4f4..12f1317 100644
+--- a/kalloc.c
++++ b/kalloc.c
+@@ -1,20 +1,17 @@
+-// Physical memory allocator, intended to allocate
+-// memory for user processes, kernel stacks, page table pages,
+-// and pipe buffers. Allocates 4096-byte pages.
+-
+ #include "types.h"
+ #include "defs.h"
+ #include "param.h"
+ #include "memlayout.h"
+ #include "mmu.h"
+ #include "spinlock.h"
++#include <stddef.h> // Include the <stddef.h> header for NULL
+ 
+ void freerange(void *vstart, void *vend);
+-extern char end[]; // first address after kernel loaded from ELF file
+-                   // defined by the kernel linker script in kernel.ld
++extern char end[];
+ 
+ struct run {
+-  struct run *next;
++  struct run *prev; // Pointer to the previous free frame
++  struct run *next; // Pointer to the next free frame
+ };
+ 
+ struct {
+@@ -23,74 +20,69 @@ struct {
+   struct run *freelist;
+ } kmem;
+ 
+-// Initialization happens in two phases.
+-// 1. main() calls kinit1() while still using entrypgdir to place just
+-// the pages mapped by entrypgdir on free list.
+-// 2. main() calls kinit2() with the rest of the physical pages
+-// after installing a full page table that maps them on all cores.
+-void
+-kinit1(void *vstart, void *vend)
++void kinit1(void *vstart, void *vend)
+ {
+   initlock(&kmem.lock, "kmem");
+   kmem.use_lock = 0;
+   freerange(vstart, vend);
+ }
+ 
+-void
+-kinit2(void *vstart, void *vend)
++void kinit2(void *vstart, void *vend)
+ {
+   freerange(vstart, vend);
+   kmem.use_lock = 1;
+ }
+ 
+-void
+-freerange(void *vstart, void *vend)
++void freerange(void *vstart, void *vend)
+ {
+   char *p;
+   p = (char*)PGROUNDUP((uint)vstart);
+   for(; p + PGSIZE <= (char*)vend; p += PGSIZE)
+     kfree(p);
+ }
+-//PAGEBREAK: 21
+-// Free the page of physical memory pointed at by v,
+-// which normally should have been returned by a
+-// call to kalloc().  (The exception is when
+-// initializing the allocator; see kinit above.)
+-void
+-kfree(char *v)
++
++void kfree(char *v)
+ {
+   struct run *r;
+ 
+   if((uint)v % PGSIZE || v < end || V2P(v) >= PHYSTOP)
+     panic("kfree");
+ 
+-  // Fill with junk to catch dangling refs.
+   memset(v, 1, PGSIZE);
+ 
+   if(kmem.use_lock)
+     acquire(&kmem.lock);
++  
+   r = (struct run*)v;
+   r->next = kmem.freelist;
++  r->prev = NULL; // For now, set prev to NULL
++  
++  if (kmem.freelist != NULL)
++    kmem.freelist->prev = r;
++  
+   kmem.freelist = r;
++
+   if(kmem.use_lock)
+     release(&kmem.lock);
+ }
+ 
+-// Allocate one 4096-byte page of physical memory.
+-// Returns a pointer that the kernel can use.
+-// Returns 0 if the memory cannot be allocated.
+-char*
+-kalloc(void)
++char* kalloc(void)
+ {
+   struct run *r;
+ 
+   if(kmem.use_lock)
+     acquire(&kmem.lock);
++  
+   r = kmem.freelist;
+-  if(r)
++  if(r) {
+     kmem.freelist = r->next;
++    if (kmem.freelist != NULL)
++      kmem.freelist->prev = NULL; // Update the previous pointer of the new head
++  }
++
+   if(kmem.use_lock)
+     release(&kmem.lock);
++  
+   return (char*)r;
+ }
+ 
+diff --git a/lseek.c b/lseek.c
+new file mode 100644
+index 0000000..589d447
+--- /dev/null
++++ b/lseek.c
+@@ -0,0 +1,18 @@
++#include "types.h"
++//#include "stat.h"
++#include "user.h"
++#include "fs.h"
++#include "fcntl.h"
++
++int main(int argc , char* argv[])
++{
++int f;
++char buff[10];
++f=open("seeker",O_RDWR);
++read(f,buff,10);
++write(1,buff,10);
++lseek(f,5,SEEK_CUR);//skips 5 characters from the current position
++read(f,buff,10);
++write(1,buff,10);
++}
++
+diff --git a/nice.c b/nice.c
+new file mode 100644
+index 0000000..568a683
+--- /dev/null
++++ b/nice.c
+@@ -0,0 +1,23 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++#include "fcntl.h"
++
++int
++main(int argc, char *argv[])
++{
++  int priority, pid;
++  if(argc < 3){
++    printf(2,"Usage: nice pid priority\n");
++    exit();
++  }
++  pid = atoi(argv[1]);
++  priority = atoi(argv[2]);
++  if (priority < 0 || priority > 20){
++    printf(2,"Invalid priority (0-20)!\n");
++    exit();
++  }
++  chpr(pid, priority);
++  printf(1,"CHPR executed() successfully!");
++  exit();
++}
+diff --git a/proc.c b/proc.c
+index 806b1b1..0df8d25 100644
+--- a/proc.c
++++ b/proc.c
+@@ -88,6 +88,7 @@ allocproc(void)
+ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
++  p->priority = 10;
+ 
+   release(&ptable.lock);
+ 
+@@ -322,14 +323,14 @@ wait(void)
+ void
+ scheduler(void)
+ {
+-  struct proc *p;
++ struct proc *p, *p1;
+   struct cpu *c = mycpu();
+   c->proc = 0;
+   
+   for(;;){
+     // Enable interrupts on this processor.
+     sti();
+-
++    struct proc *highP;
+     // Loop over process table looking for process to run.
+     acquire(&ptable.lock);
+     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+@@ -339,6 +340,15 @@ scheduler(void)
+       // Switch to chosen process.  It is the process's job
+       // to release ptable.lock and then reacquire it
+       // before jumping back to us.
++      highP = p;
++      //choose one with highest priority
++      for(p1 = ptable.proc; p1 < &ptable.proc[NPROC]; p1++){
++	if(p1->state != RUNNABLE)
++	  continue;
++	if(highP->priority > p1->priority)   //larger value, lower priority
++	  highP = p1;
++      }
++      p = highP;
+       c->proc = p;
+       switchuvm(p);
+       p->state = RUNNING;
+@@ -532,3 +542,46 @@ procdump(void)
+     cprintf("\n");
+   }
+ }
++
++int
++cps()
++{
++struct proc *p;
++//Enables interrupts on this processor.
++sti();
++
++//Loop over process table looking for process with pid.
++acquire(&ptable.lock);
++cprintf("name \t pid \t state \t priority \n");
++for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++  if(p->state == SLEEPING)
++	  cprintf("%s \t %d \t SLEEPING \t %d \n ", p->name,p->pid,p->priority);
++	else if(p->state == RUNNING)
++ 	  cprintf("%s \t %d \t RUNNING \t %d \n ", p->name,p->pid,p->priority);
++	else if(p->state == RUNNABLE)
++ 	  cprintf("%s \t %d \t RUNNABLE \t %d \n ", p->name,p->pid,p->priority);
++}
++release(&ptable.lock);
++return 22;
++}
++
++int 
++chpr(int pid, int priority)
++{
++	struct proc *p;
++	acquire(&ptable.lock);
++	for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++	  if(p->pid == pid){
++			p->priority = priority;
++			break;
++		}
++	}
++	release(&ptable.lock);
++	return pid;
++}
++
++
++
++
++
++
+diff --git a/proc.h b/proc.h
+index 1647114..a4d5e27 100644
+--- a/proc.h
++++ b/proc.h
+@@ -49,6 +49,7 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int priority;
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+diff --git a/ps.c b/ps.c
+new file mode 100644
+index 0000000..744757f
+--- /dev/null
++++ b/ps.c
+@@ -0,0 +1,9 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++#include "fcntl.h"
++
++int main(void){
++  cps();
++  exit();
++}
+diff --git a/syscall.c b/syscall.c
+index ee85261..af07f17 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -103,6 +103,9 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_lseek(void);
++extern int sys_cps(void);
++extern int sys_chpr(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +129,9 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_lseek]   sys_lseek,
++[SYS_cps]     sys_cps,
++[SYS_chpr]    sys_chpr,
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index bc5f356..68b9e20 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,6 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_lseek  22
++#define SYS_cps    23
++#define SYS_chpr   24
+diff --git a/sysfile.c b/sysfile.c
+index bfe61b7..33443c6 100644
+--- a/sysfile.c
++++ b/sysfile.c
+@@ -442,3 +442,38 @@ sys_pipe(void)
+   fd[1] = fd1;
+   return 0;
+ }
++
++int
++sys_lseek(void)
++{
++    int fd, offset, whence;
++    struct file *f;
++
++    if (argfd(0, &fd,&f) < 0 || argint(1, &offset) < 0 || argint(2, &whence) < 0)
++        return -1;
++
++    if (whence < 0 || whence > 2)
++        return -1;
++
++  
++
++    switch (whence)
++    {
++    case SEEK_SET:
++        f->off = offset;
++        break;
++    case SEEK_CUR:
++        f->off += offset;
++        break;
++    case SEEK_END:
++        f->off = f->ip->size + offset;
++        break;
++    default:
++
++        return -1;
++    }
++
++    //release(&f->ip->lock);
++    return f->off;
++}
++
+diff --git a/sysproc.c b/sysproc.c
+index 0686d29..2e6150d 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -89,3 +89,22 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++
++int
++sys_cps(void)
++{
++  return cps();
++}
++
++int
++sys_chpr(void)
++{
++  int pid, pr;
++  if(argint(0, &pid) < 0)
++    return -1;
++  if(argint(1, &pr) < 0)
++    return -1;
++
++  return chpr(pid, pr);
++}
+diff --git a/test.c b/test.c
+new file mode 100644
+index 0000000..ecc167e
+--- /dev/null
++++ b/test.c
+@@ -0,0 +1,66 @@
++#include "types.h"
++#include "user.h"
++
++#define NPROC 10
++#define NUM_TRIALS 5
++
++void long_task() {
++    // Simulate a long task
++    volatile int i;
++    for (i = 0; i < 1000000; i++);
++}
++
++int run_test() {
++    int pid;
++    int i;
++    int start_time, end_time;
++
++    // Create NPROC processes with different priorities
++    for (i = 0; i < NPROC; i++) {
++        pid = fork();
++        if (pid < 0) {
++            printf(1, "Fork failed\n");
++            exit();
++        } else if (pid == 0) {
++            // Child process
++            if (i % 2 == 0)
++                chpr(getpid(), 1); // Even-numbered processes have higher priority
++            else
++                chpr(getpid(), 0); // Odd-numbered processes have lower priority
++            long_task(); // Simulate a long task
++            exit();
++        }
++    }
++
++    start_time = uptime(); // Record the start time
++
++    // Wait for all child processes to finish
++    for (i = 0; i < NPROC; i++) {
++        wait();
++    }
++
++    end_time = uptime(); // Record the end time
++
++    return NPROC / ((end_time - start_time) / 1000.0); // Calculate throughput
++}
++
++int main() {
++    int i;
++    float total_throughput = 0.0;
++
++    printf(1, "Starting throughput test...\n");
++
++    // Perform multiple trials
++    for (i = 0; i < NUM_TRIALS; i++) {
++        int throughput = run_test();
++        printf(1, "Trial %d: Throughput = %d/sec\n", i + 1, throughput);
++        total_throughput += throughput;
++    }
++
++    // Calculate and print average throughput
++    int average_throughput = total_throughput / NUM_TRIALS;
++    printf(1, "Average throughput = %d/sec\n", average_throughput);
++
++    exit();
++}
++
+diff --git a/user.h b/user.h
+index 4f99c52..10e7f1b 100644
+--- a/user.h
++++ b/user.h
+@@ -23,6 +23,9 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int lseek(int,int,int);
++int cps(void);
++int chpr(int pid, int priority);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..605745d 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,6 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(lseek)
++SYSCALL(cps)
++SYSCALL(chpr)
